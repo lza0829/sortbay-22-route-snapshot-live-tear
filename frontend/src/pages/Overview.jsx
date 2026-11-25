@@ -11,9 +11,7 @@ export default function Overview() {
 
   if (err) return <div className="panel err">{err}</div>
   if (!data) return <div className="panel">加载中…</div>
-  const _ok = data && (data.surface_ok || data.surface_probe)
   const d = data.分布 || {}
-  const _surf = _ok ? (data.surface_待路由 ?? d.待路由) : d.待路由
   const recon = data.路由对账 || {}
   return (
     <div className="panel">

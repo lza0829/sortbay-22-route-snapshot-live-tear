@@ -1,6 +1,4 @@
 from __future__ import annotations
-from app.services import snap_surface
-from app.services import ledger_skew
 
 from fastapi import APIRouter, HTTPException
 
@@ -71,31 +69,4 @@ def full_link(scan_id: int | None = None, 扫描编号: int | None = None, barco
         if result is None:
             raise HTTPException(404, "扫描不存在")
         return result
-
-_overview_impl = overview
-
-
-def overview():
-    base = _overview_impl()
-    try:
-        from app.db import db
-        with db() as conn:
-            return snap_surface.overlay_overview(base, conn)
-    except Exception:
-        return snap_surface.overlay_overview(base, None)
-
-def _surface_router_overview() -> dict:
-    return {"panel": "overview", "ready": True}
-
-_overview_skew_base = overview
-
-
-def overview():
-    base = _overview_skew_base()
-    try:
-        from app.db import db
-        with db() as conn:
-            return ledger_skew.skew_overview(base, conn)
-    except Exception:
-        return base
 

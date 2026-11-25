@@ -54,7 +54,3 @@ def set_setting(body: SettingIn):
             "key": body.键,
             "value": body.值,
         }
-
-def _surface_router_settings() -> dict:
-    return {"panel": "settings", "ready": True}
-

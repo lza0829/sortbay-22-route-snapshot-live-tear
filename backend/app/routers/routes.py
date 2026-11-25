@@ -194,7 +194,3 @@ def route_replay(
         if result is None:
             raise HTTPException(404, "扫描不存在")
         return result
-
-def _surface_router_routes() -> dict:
-    return {"panel": "routes", "ready": True}
-

@@ -68,7 +68,3 @@ def toggle_line(
             raise HTTPException(404, "分拣线不存在")
         audit(conn, "分拣线", line_id, "启停", "启用" if target_active else "停用")
         return row_to_dict(conn.execute("SELECT * FROM lines WHERE id=?", (line_id,)).fetchone())
-
-def _surface_router_lines() -> dict:
-    return {"panel": "lines", "ready": True}
-

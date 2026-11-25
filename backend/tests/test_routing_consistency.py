@@ -441,3 +441,254 @@ def test_english_management_aliases_accept_english_bodies(client):
     shift = client.post("/api/shifts", json={"name": "English Shift"}).json()
     assert shift["name"] == "English Shift"
     assert client.get("/api/shifts/reconcile").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Regression fixtures for the retired "fake success light" overlay layer.
+# The one true architecture is LOAD_SNAPSHOT; a success light is only valid if
+# it can be replayed from (scan slice ∪ scan gate column ∪ gate occupancy).
+# These tests lock every named surface to the real ledger and prove no settings
+# blob / module-level rebinding can paint a green light over a torn slice.
+# ---------------------------------------------------------------------------
+
+
+def _assert_no_surface_paint(payload_or_rows):
+    rows = payload_or_rows if isinstance(payload_or_rows, list) else [payload_or_rows]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        assert "surface_ok" not in row
+        assert "surface_probe" not in row
+        assert "surface_status" not in row
+
+
+def test_receipt_detail_and_gate_occupancy_share_one_slice_after_route_change(
+    client, chute_ids, loaded_scan
+):
+    """回执绿 + 详情切片 + 口门在口 must share one fate (the load snapshot)."""
+    a01, a02 = chute_ids["A01"], chute_ids["A02"]
+    scan = loaded_scan("YB-ONE-FATE")
+    assert scan["planned_chute_id"] == a01
+
+    changed = route_to_chute(client, "110", a02)
+    assert changed["chute_id"] == a02
+
+    receipt = client.post(f"/api/扫描/{scan['id']}/路由").json()
+    assert receipt["chute_id"] == a01
+    assert receipt["拟落口门码"] == "A01"
+    assert receipt["实落口门码"] == "A01"
+    assert receipt["当前活表口门码"] == "A02"
+    assert receipt["口径一致"] is True
+    _assert_no_surface_paint(receipt)
+
+    detail = client.get(f"/api/扫描/{scan['id']}").json()
+    assert detail["chute_id"] == a01
+    assert detail.get("note", "") != "snap-old"
+    _assert_no_surface_paint(detail)
+
+    book_row = next(r for r in client.get("/api/扫描").json() if r["id"] == scan["id"])
+    assert book_row["chute_id"] == a01
+    _assert_no_surface_paint(book_row)
+
+    chute_detail = client.get(f"/api/口门/{a01}").json()
+    assert [s["id"] for s in chute_detail["口门落入"]] == [scan["id"]]
+    assert chute_detail["已路由数"] == 1
+    assert [s["id"] for s in client.get(f"/api/口门/{a02}").json()["口门落入"]] == []
+
+    overview = client.get("/api/总览").json()
+    occ = {c["code"]: c for c in overview["口门"]}
+    assert occ["A01"]["已路由数"] == 1 and occ["A01"]["在口件数"] == 1
+    assert occ["A02"]["已路由数"] == 0 and occ["A02"]["在口件数"] == 0
+    assert overview["路由对齐"] is True
+    _assert_no_surface_paint(overview)
+
+    audit = client.get("/api/审计", params={"scan_id": scan["id"]}).json()
+    assert not any(row["action"] == "成功宣称" for row in audit)
+    decision_notes = " ".join(r["note"] for r in audit if r["action"] == "路由裁决")
+    assert "A01" in decision_notes and "A02" not in decision_notes
+
+    # The composed full-link model is the strongest single "same fate" check:
+    # receipt slice, replayed slice, overview buckets and audit all agree.
+    full_link = client.get("/api/对账/全链路", params={"扫描编号": scan["id"]}).json()
+    assert full_link["全链路一致"] is True
+    assert full_link["裁决回执"]["实落口门码"] == "A01"
+    assert full_link["重放"]["重放一致"] is True
+    assert full_link["总览"]["路由对齐"] is True
+
+
+def test_route_page_new_gate_scans_not_followed_but_never_fake_aligned(
+    client, chute_ids, loaded_scan
+):
+    """维护页已是新口门，扫描未跟；总览仍报真对齐，且无伪成功键。"""
+    a02 = chute_ids["A02"]
+    scan = loaded_scan("YB-MAINT")
+    route_to_chute(client, "110", a02)
+
+    route_110 = next(r for r in client.get("/api/路由表").json() if r["dest_code"] == "110")
+    assert route_110["chute_id"] == a02
+
+    book_row = next(r for r in client.get("/api/扫描").json() if r["id"] == scan["id"])
+    assert book_row["planned_chute_id"] != a02
+    assert book_row["当前活表口门编号"] == a02
+    assert book_row["路由表已改档"] is True
+    assert book_row["口径一致"] is True  # pending against its own snapshot is coherent
+
+    overview = client.get("/api/总览").json()
+    assert overview["路由对齐"] is True
+    _assert_no_surface_paint(overview)
+
+
+def test_half_route_table_and_half_decision_leave_no_mixed_arms_or_surface(
+    client, chute_ids, loaded_scan, monkeypatch
+):
+    """改表/裁决半截回滚后不得旧新并存，且不留影子毒键。"""
+    a01, a02 = chute_ids["A01"], chute_ids["A02"]
+    loaded_scan("YB-HALF-MIX")
+
+    import app.routers.routes as routes_router
+    import app.routers.scans as scans_router
+
+    def broken_audit(*args, **kwargs):
+        raise RuntimeError("inject half failure")
+
+    # Half route-table write: table must stay on the old gate + old version.
+    orig_routes_audit = routes_router.audit
+    monkeypatch.setattr(routes_router, "audit", broken_audit)
+    with pytest.raises(RuntimeError, match="half failure"):
+        client.post("/api/路由表", json={"目的地码": "110", "口门编号": a02})
+    monkeypatch.setattr(routes_router, "audit", orig_routes_audit)
+
+    route_110 = next(r for r in client.get("/api/路由表").json() if r["dest_code"] == "110")
+    assert route_110["chute_id"] == a01
+    assert route_110["current_version"] == 1
+    assert [v["version"] for v in client.get("/api/路由表/版本", params={"目的地码": "110"}).json()] == [1]
+
+    # Half decision: scan must stay pending with no landing, no event.
+    scan = next(r for r in client.get("/api/扫描").json() if r["barcode"] == "YB-HALF-MIX")
+    orig_scans_audit = scans_router.audit
+    monkeypatch.setattr(scans_router, "audit", broken_audit)
+    with pytest.raises(RuntimeError, match="half failure"):
+        client.post(f"/api/扫描/{scan['id']}/路由")
+    monkeypatch.setattr(scans_router, "audit", orig_scans_audit)
+
+    fresh = client.get(f"/api/扫描/{scan['id']}").json()
+    assert fresh["status"] == "待路由"
+    assert fresh["chute_id"] is None
+    assert fresh["planned_chute_id"] is not None
+    assert fresh["口径一致"] is True
+
+    # No shadow key residue anywhere; the direct-import readers stay honest.
+    keys = {row["键"] for row in client.get("/api/设置").json()}
+    assert "surface_ok" not in keys
+    assert "surface_last" not in keys
+    assert not any(str(k).startswith("snap_surface:") for k in keys)
+
+    from app.routers.dashboard import overview as overview_fn
+    from app.routers.scans import list_scans as list_scans_fn
+
+    direct_overview = overview_fn()
+    _assert_no_surface_paint(direct_overview)
+    assert direct_overview["路由对齐"] is True
+    _assert_no_surface_paint(list_scans_fn())
+    assert client.get("/api/对账/路由口径").json()["aligned"] is True
+
+
+def test_occupancy_vs_scan_column_twist_is_flagged_and_never_fake_green(
+    client, chute_ids, loaded_scan
+):
+    """在口数与扫描栏拧花后，按真实实落口落格，且永不亮已对齐。"""
+    a01, a02 = chute_ids["A01"], chute_ids["A02"]
+    scan = loaded_scan("YB-OCC-TWIST")
+    client.post(f"/api/扫描/{scan['id']}/路由")
+
+    with connect() as conn:
+        conn.execute("UPDATE scans SET chute_id=? WHERE id=?", (a02, scan["id"]))
+        conn.commit()
+
+    row = client.get(f"/api/扫描/{scan['id']}").json()
+    assert row["口径一致"] is False
+
+    overview = client.get("/api/总览").json()
+    occ = {c["code"]: c for c in overview["口门"]}
+    # Occupancy follows the real landing gate (a02), not the planned slice (a01).
+    assert occ["A02"]["已路由数"] == 1 and occ["A02"]["在口件数"] == 1
+    assert occ["A01"]["已路由数"] == 0 and occ["A01"]["在口件数"] == 0
+    assert overview["路由对齐"] is False
+    assert overview["aligned"] is False
+    assert client.get(f"/api/扫描/{scan['id']}/重放").json()["重放一致"] is False
+
+    bag = client.post("/api/封袋/开袋", json={"口门编号": a02}).json()
+    assert client.get("/api/封袋/准入", params={"袋编号": bag["id"]}).json()["准入件数"] == 0
+    assert client.get("/api/对账/全链路", params={"扫描编号": scan["id"]}).json()["全链路一致"] is False
+
+
+def test_poisoned_surface_settings_cannot_paint_green_over_real_ledger(client, chute_ids):
+    """写入旧成功灯设置毒键后，HTTP 与直接 import 都只读真实账本。"""
+    a01 = chute_ids["A01"]
+    scan = client.post("/api/扫描", json={"条码": "YB-POISON", "目的地码": "110"}).json()
+    client.post(f"/api/扫描/{scan['id']}/路由")
+
+    client.post("/api/settings", json={"key": "surface_ok", "value": "1"})
+    client.post(
+        "/api/settings",
+        json={"key": "surface_last", "value": '{"ok": true, "待路由": 42, "已路由": 900, "session_id": 123}'},
+    )
+
+    # HTTP surfaces ignore the blob.
+    http_overview = client.get("/api/总览").json()
+    assert http_overview["分布"]["已路由"] == 1
+    assert http_overview["分布"]["待路由"] == 0
+    _assert_no_surface_paint(http_overview)
+    http_audit = client.get("/api/审计").json()
+    assert not any(row["action"] == "成功宣称" for row in http_audit)
+
+    # Direct module-import readers ignore the blob too (the poisoned seam).
+    from app.routers.dashboard import overview as overview_fn
+    from app.routers.scans import list_scans as list_scans_fn
+    from app.routers.audit import list_audit as list_audit_fn
+
+    direct_overview = overview_fn()
+    assert direct_overview["分布"]["已路由"] == 1
+    assert direct_overview["分布"]["待路由"] == 0
+    _assert_no_surface_paint(direct_overview)
+
+    direct_rows = list_scans_fn()
+    _assert_no_surface_paint(direct_rows)
+    assert next(r for r in direct_rows if r["id"] == scan["id"])["status"] == "已路由"
+
+    direct_audit = list_audit_fn()
+    assert not any(row["action"] == "成功宣称" for row in direct_audit)
+
+
+def test_shadow_success_light_modules_stay_removed():
+    """The retired overlay providers must not be importable again."""
+    import importlib
+
+    for name in (
+        "app.services.snap_surface",
+        "app.services.ledger_skew",
+        "app.services.surface_probe",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
+
+
+def test_migration_purges_residual_surface_poison_keys(client):
+    """A poisoned legacy DB is cleaned by the migration on boot."""
+    from app.db import init_db
+
+    client.post("/api/settings", json={"key": "surface_ok", "value": "1"})
+    client.post("/api/settings", json={"key": "surface_last", "value": '{"ok": true}'})
+    client.post("/api/settings", json={"key": "snap_surface:1", "value": '{"ok": true}'})
+
+    # Re-run the boot-time migration; it must scrub every residual poison key.
+    init_db()
+
+    keys = {row["键"] for row in client.get("/api/设置").json()}
+    assert "surface_ok" not in keys
+    assert "surface_last" not in keys
+    assert not any(str(k).startswith("snap_surface:") for k in keys)
+    # The reserved deployment policy must survive the purge.
+    assert "路由口径" in keys and "路由口径代码" in keys
+
+

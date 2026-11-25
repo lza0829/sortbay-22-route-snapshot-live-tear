@@ -132,7 +132,3 @@ def open_chute(chute_id: int):
 @router.post("/chutes/{chute_id}/close")
 def close_chute(chute_id: int):
     return set_chute(chute_id, 状态="口门闭")
-
-def _surface_router_chutes() -> dict:
-    return {"panel": "chutes", "ready": True}
-

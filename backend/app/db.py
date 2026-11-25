@@ -282,6 +282,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         (ROUTE_POLICY_LABEL, ROUTE_POLICY),
     )
 
+    # Purge any residue from the retired "fake success light" overlay layer.
+    # Those keys/bindings could repaint overview counts and audit rows from a
+    # settings blob detached from the real load-snapshot ledger; the readers are
+    # gone, so dropping the poison here is defence in depth for existing DBs.
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('surface_ok', 'surface_last') "
+        "OR key LIKE 'snap_surface:%'"
+    )
+    # The same layer smeared the real scans.note ledger field with this sentinel.
+    conn.execute("UPDATE scans SET note='' WHERE note='snap-old'")
+
 
 def config_now() -> str:
     from datetime import datetime

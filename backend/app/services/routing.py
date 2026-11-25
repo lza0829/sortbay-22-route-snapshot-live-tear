@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import snap_surface
 
 from typing import Any
 
@@ -637,11 +636,4 @@ def consistency_report(conn) -> dict[str, Any]:
         "口门桶": chute_counts,
         "chute_buckets": chute_counts,
     }
-
-_record_route_version_impl = record_route_version
-
-
-def record_route_version(*args, **kwargs):
-    out = _record_route_version_impl(*args, **kwargs)
-    return snap_surface.after_route(out, *args, **kwargs)
 
