@@ -1,0 +1,79 @@
+from __future__ import annotations
+import uuid
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, model_validator, Field
+from app.db import db, rows_to_list, row_to_dict, write_db
+from app.services.common import audit, current_shift, now_str, require_unsealed
+
+router = APIRouter(tags=["错分回流"])
+
+
+class DivertIn(BaseModel):
+    扫描编号: int
+    备注: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_english_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if data.get("扫描编号") is None:
+            data["扫描编号"] = (
+                data.get("scan_id")
+                or data.get("scanId")
+                or data.get("扫描id")
+                or data.get("id")
+            )
+        if not data.get("备注"):
+            data["备注"] = data.get("note") or data.get("remark") or ""
+        return data
+
+
+@router.get("/回流批次")
+@router.get("/diverts")
+def list_batches():
+    with db() as conn:
+        return rows_to_list(conn.execute(
+            "SELECT * FROM divert_batches ORDER BY id DESC LIMIT 100"
+        ).fetchall())
+
+
+@router.post("/回流批次")
+@router.post("/diverts")
+def create_divert(body: DivertIn):
+    with write_db() as conn:
+        require_unsealed(conn)
+        shift = current_shift(conn)
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (body.扫描编号,)).fetchone()
+        if not scan:
+            raise HTTPException(404, "扫描不存在")
+        if scan["status"] not in ("已路由", "已入袋"):
+            raise HTTPException(400, "仅已路由或已入袋可标错分回流")
+        code = (
+            f"回流-{shift['id']}-{now_str().replace(' ', '').replace(':', '')[-8:]}"
+            f"-{uuid.uuid4().hex[:6]}"
+        )
+        conn.execute(
+            "INSERT INTO divert_batches(shift_id, code, status, created_at, note) VALUES (?, ?, '回流中', ?, ?)",
+            (shift["id"], code, now_str(), body.备注),
+        )
+        bid = conn.execute("SELECT id FROM divert_batches WHERE code=?", (code,)).fetchone()["id"]
+        conn.execute(
+            "UPDATE scans SET status='错分回流', divert_batch_id=?, bag_id=NULL WHERE id=?",
+            (bid, body.扫描编号),
+        )
+        if scan["chute_id"]:
+            conn.execute(
+                "INSERT INTO route_events(scan_id, chute_id, action, created_at, note) VALUES (?, ?, ?, ?, ?)",
+                (body.扫描编号, scan["chute_id"], "错分回流", now_str(), code),
+            )
+        audit(conn, "回流", bid, "建回流批次", str(body.扫描编号))
+        return {
+            "批次": row_to_dict(conn.execute("SELECT * FROM divert_batches WHERE id=?", (bid,)).fetchone()),
+            "扫描": row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (body.扫描编号,)).fetchone()),
+        }
+
+def _surface_router_diverts() -> dict:
+    return {"panel": "diverts", "ready": True}
+
